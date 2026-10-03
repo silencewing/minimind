@@ -139,15 +139,26 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # 把相对路径解析为相对脚本所在目录的绝对路径，避免受运行时 CWD 影响
-    # （原始默认值如 ../model / ../dataset/... 是相对于 trainer/ 目录写的）
+    # 路径解析策略：
+    #   1. 用户显式传入的相对路径（如 ./dataset/xxx）按 CWD 解析
+    #   2. 默认值（如 ../model）按脚本目录解析（保持向后兼容）
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    if not os.path.isabs(args.data_path):
-        args.data_path = os.path.abspath(os.path.join(script_dir, args.data_path))
-    if not os.path.isabs(args.tokenizer_path):
-        args.tokenizer_path = os.path.abspath(os.path.join(script_dir, args.tokenizer_path))
-    if not os.path.isabs(args.save_dir):
-        args.save_dir = os.path.abspath(os.path.join(script_dir, args.save_dir))
+
+    def _resolve(p: str, default: str) -> str:
+        if os.path.isabs(p):
+            return p
+        if p == default:
+            # 默认值：相对脚本目录解析
+            return os.path.abspath(os.path.join(script_dir, p))
+        # 用户传入的路径：先按 CWD 解析，若不存在再回退到脚本目录
+        cwd_resolved = os.path.abspath(p)
+        if os.path.exists(cwd_resolved) or os.path.exists(os.path.dirname(cwd_resolved)):
+            return cwd_resolved
+        return os.path.abspath(os.path.join(script_dir, p))
+
+    args.data_path = _resolve(args.data_path, "../dataset/pretrain_t2t_mini.jsonl")
+    args.tokenizer_path = _resolve(args.tokenizer_path, "../model")
+    args.save_dir = _resolve(args.save_dir, "../out")
 
     # ========== 1. 初始化环境（分布式 DDP/单机 FP16 可选）==========
     local_rank = init_distributed_mode()
