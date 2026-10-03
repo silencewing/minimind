@@ -240,12 +240,10 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
 
 # ================================ 工具与 Reward = End ================================
 def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model=None, start_step=0, wandb=None, use_sglang=False):
-    last_step = start_step
     for step, batch in enumerate(loader, start=start_step + 1):
         messages_batch = batch['messages']
         tools_batch = batch['tools']
         gt_batch = batch['gt']
-        last_step = step
 
         with torch.no_grad():
             completions, contexts, prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch, turn_outputs_batch, unfinished_batch = rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, args.num_generations, max_turns=3, max_new_tokens=args.max_gen_len, thinking_ratio=args.thinking_ratio, device=args.device)
@@ -273,8 +271,6 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         rewards = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch)
 
         with autocast_ctx:
-            # 反向传播必须经过 DDP 包装后的模块：直接调用 .module 会跳过
-            # DDP 的 prepare_for_backward，梯度不会 all-reduce，各卡静默发散。
             res = model(input_ids, attention_mask=full_mask)
             aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
             logits = res.logits[:, :-1, :]
@@ -333,7 +329,7 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         loss = (policy_loss + aux_loss) / args.accumulation_steps
         loss.backward()
 
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             if args.grad_clip > 0: torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step(); scheduler.step(); optimizer.zero_grad()
 
@@ -366,10 +362,6 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
 
         del per_token_logps, ref_per_token_logps
         del completions, rewards, grouped_rewards, mean_r, std_r, advantages, completion_mask
-
-    if last_step > start_step and last_step % args.accumulation_steps != 0:
-        if args.grad_clip > 0: torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step(); scheduler.step(); optimizer.zero_grad()
 
 
 if __name__ == "__main__":
@@ -471,9 +463,9 @@ if __name__ == "__main__":
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
-        rollout_engine.update_policy(model)
     if dist.is_initialized():
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        # 同 train_ppo：RoPE buffer 各 rank 一致，每步广播纯属浪费
+        model = DistributedDataParallel(model, device_ids=[local_rank], broadcast_buffers=False)
     rollout_engine.update_policy(model)
 
     for epoch in range(start_epoch, args.epochs):

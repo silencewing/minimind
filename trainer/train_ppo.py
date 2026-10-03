@@ -36,7 +36,7 @@ def rep_penalty(text, n=3, cap=0.5):
 class CriticModel(MiniMindForCausalLM):
     def __init__(self, params):
         super().__init__(params)
-        # 替换lm_head为输出单一价值的线性层
+        # lm_head 不参与 forward，仅靠 tie_word_embeddings 与 embed_tokens 共享权重，解绑后 DDP 会报未使用参数
         self.value_head = nn.Linear(params.hidden_size, 1)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
@@ -166,16 +166,12 @@ def ppo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, actor_sched
             for i in range(0, B, mb_size):
                 inds = b_inds[i:i + mb_size]
                 
-                # 反向传播必须经过 DDP 包装后的模块：直接调用 .module 会跳过
-                # DDP 的 prepare_for_backward，梯度不会 all-reduce，各卡静默发散。
                 mb_values_seq = critic_model(input_ids=gen_out[inds], attention_mask=full_mask[inds])
                 mb_resp_values = mb_values_seq.gather(1, logp_pos[inds])
 
                 with autocast_ctx:
                     res = actor_model(input_ids=gen_out[inds], attention_mask=full_mask[inds])
                     aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
-                    # 在 autocast 内计算 log_softmax，避免直接对 fp16/bf16 logits
-                    # 计算造成额外数值偏差。
                     mb_resp_logp = F.log_softmax(res.logits[:, :-1], dim=-1).gather(2, labels[inds].unsqueeze(-1)).squeeze(-1).gather(1, logp_pos[inds])
 
                 log_ratio = mb_resp_logp - old_resp_logp[inds]
@@ -427,10 +423,10 @@ if __name__ == "__main__":
     if args.use_compile == 1:
         actor_model = torch.compile(actor_model)
         Logger('torch.compile enabled')
-        rollout_engine.update_policy(actor_model)
     if dist.is_initialized():
-        actor_model = DistributedDataParallel(actor_model, device_ids=[local_rank])
-        critic_model = DistributedDataParallel(critic_model, device_ids=[local_rank])
+        # freqs_cos/freqs_sin 各 rank 由 config 确定性算出，默认每步广播一次纯属浪费
+        actor_model = DistributedDataParallel(actor_model, device_ids=[local_rank], broadcast_buffers=False)
+        critic_model = DistributedDataParallel(critic_model, device_ids=[local_rank], broadcast_buffers=False)
     rollout_engine.update_policy(actor_model)
     
     # ========== 8. 开始训练 ==========
