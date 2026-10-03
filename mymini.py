@@ -14,6 +14,11 @@ class MiniMindConfig:
     num_kv_heads: int = 4
     num_encoder_layers: int = 4
     num_decoder_layers: int = 12
+    vocab_size: int = 6400           # 词表大小，需与 tokenizer 一致
+    use_moe: bool = False            # 是否启用 MoE（保留字段以兼容 lm_checkpoint）
+    bos_token_id: int = 1
+    eos_token_id: int = 2
+    pad_token_id: int = 0
 
 
 def init_orthogonal(module: nn.Module, dim: Optional[int] = None):
@@ -128,65 +133,81 @@ def create_attention_mask(bsz, device=None):
 
 class MyMiniModel(nn.Module):
     """Encoder-Decoder with PCAEncoder + LogAttention"""
-    
+
     def __init__(self, config=None):
         super().__init__()
-        
-        self.config = config or MiniMindConfig()
+
+        self.config = MiniMindConfig() if config is None else config
         self.hidden_size = self.config.hidden_size
-        
-        # RoPE position encoding for causal self-attention
-        head_dim = self.config.hidden_size // self.config.num_attention_heads if hasattr(self.config, 'num_attention_heads') else 64
-        scale = self.config.hidden_size ** -0.5 if hasattr(self.config, 'hidden_size') else 1.0
-        
+        encoder_hidden_dim = getattr(self.config, 'encoder_hidden_dim', 512)
+
+        # Token embedding: [vocab_size, hidden_size]
+        self.embed_tokens = nn.Embedding(self.config.vocab_size, self.hidden_size,
+                                         padding_idx=getattr(self.config, 'pad_token_id', 0))
+
+        # Position embedding (kept for compatibility with trainer's pe.embedding_dim reference)
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
         max_positions = 16384 if self.config.num_encoder_layers > 1 else 2048
-        self.pe = nn.Embedding(max_positions, min(head_dim, 64))
-        
-        # PCAEncoder components: encoder_latent_x_pca + decoder projections (dec_proj_l/h,q)
-        encoder_latent_x_pca = nn.Linear(self.hidden_size, min(self.config.encoder_hidden_dim // 2, 512 // 4)) if hasattr(self.config, 'encoder_hidden_dim') else None
-        self.encoder_latent_x_pca = encoder_latent_x_pca
-        
-        dim_q = (config.num_attention_heads // 4) * (head_dim if hasattr(config, 'num_attention_heads') and hasattr(config, 'hidden_size') else head_dim*2) if hasattr(config, 'num_attention_heads') else head_dim * 2
-        encoder_latent_x_q = nn.Linear(dim_q, head_dim)
-        self.encoder_latent_x_q = encoder_latent_x_q
-        
-        # Initialize decoder projections with orthogonal constraints (Low/High latent paths for dec_proj_l/h/q)
-        def init_decoder_layer(out_features):
-            module = nn.Linear(head_dim, out_features if hasattr(nn.Linear, '__init__') else head_dim*4)
-            return module
-        
-    def forward(self, x: Tensor, encoder_hidden_states=None):
+        self.pe = nn.Embedding(max_positions, head_dim)
+
+        # PCAEncoder: latent projection for encoder state x -> x'
+        self.encoder_latent_x_pca = nn.Linear(self.hidden_size, encoder_hidden_dim)
+        # Low / High latent decoder projections: x' -> head_dim
+        self.dec_proj_l = nn.Linear(encoder_hidden_dim, head_dim)
+        self.dec_proj_h = nn.Linear(encoder_hidden_dim, head_dim)
+        # Project combined head_dim back to hidden_size for the LM head
+        self.dec_proj_out = nn.Linear(head_dim, self.hidden_size)
+
+        # Output normalization + LM head (logits over vocab)
+        self.layer_norm = nn.LayerNorm(self.hidden_size)
+        self.lm_head = nn.Linear(self.hidden_size, self.config.vocab_size, bias=False)
+
+        # Tie weights to reduce parameter count and stabilize training
+        self.embed_tokens.weight = self.lm_head.weight
+
+        # Initialize decoder projections with orthogonal constraints
+        init_orthogonal(self.dec_proj_l)
+        init_orthogonal(self.dec_proj_h)
+
+    def forward(self, input_ids: Tensor):
         """
         Args:
-            x: [B, L, D=hidden_size] input sequence
-            encoder_hidden_states: external encoder states (optional)
+            input_ids: [B, L] long tensor of token ids
         Returns:
-            outputs: [B, L, D] decoder output + latent representation
+            logits: [B, L, vocab_size] tensor of vocabulary logits
         """
-        bsz, seq_len, dim = x.shape
-        
-        # RoPE Position Encoding (sin/cos interpolation + rotation)
-        max_positions = 16384 if self.config.num_encoder_layers > 1 else 2048
-        pe_dim = self.pe.embedding_dim
-        
-        
-        # PCAEncoder: compute encoder_latent_x_pca -> latent state x'
-        with torch.no_grad():
-            if hasattr(self, 'encoder_latent_x_pca') and self.encoder_latent_x_pca is not None:
-                encoder_latent_x_pca = self.encoder_latent_x_pca(x)
+        bsz, seq_len = input_ids.shape
 
-                
+        # 1. Token embedding -> hidden states
+        h = self.embed_tokens(input_ids)  # [B, L, hidden_size]
+
+        # 2. PCA projection to latent state x'
+        x_pca = self.encoder_latent_x_pca(h)  # [B, L, encoder_hidden_dim]
+
+        # 3. Low / High latent decoder projections
+        dec_l = self.dec_proj_l(x_pca)  # [B, L, head_dim]
+        dec_h = self.dec_proj_h(x_pca)  # [B, L, head_dim]
+        combined = dec_l + dec_h  # [B, L, head_dim]
+
+        # 4. Project back to hidden_size + residual + norm
+        out = self.layer_norm(self.dec_proj_out(combined) + h)  # [B, L, hidden_size]
+
+        # 5. LM head -> logits over vocab
+        logits = self.lm_head(out)  # [B, L, vocab_size]
+        return logits
+
+
 def test_basic():
     """Basic test to verify code works without errors"""
     config = MiniMindConfig(hidden_size=1024, num_encoder_layers=4, num_attention_heads=8)
-    
+
     model = MyMiniModel(config)
-    print("✅ Model created successfully")
-    
-    x = torch.randn(2, 50, 1024)
+    print("Model created successfully")
+
+    x = torch.randint(0, config.vocab_size, (2, 50), dtype=torch.long)
     with torch.no_grad():
         y = model(x)
-    print(f"✅ Forward pass successful. Output shape check: {hasattr(y, 'shape')}")
+    print(f"Forward pass successful. Output shape: {tuple(y.shape)}")
 
 
 if __name__ == "__main__":
