@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from typing import Optional, Tuple, List
-
+from dataclasses import *
 
 @dataclass
 class MiniMindConfig:
@@ -191,3 +191,4 @@ def test_basic():
 
 if __name__ == "__main__":
     test_basic()
+    
