@@ -238,7 +238,11 @@ if __name__ == "__main__":
         model = torch.compile(model, mode="reduce-overhead")
 
     if dist.is_initialized():
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            find_unused_parameters=True,
+        )
 
     # ========== 9. 开始训练（epoch 级主循环）==========
     iters = len(train_loader)

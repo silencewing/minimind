@@ -145,10 +145,11 @@ class MyMiniModel(nn.Module):
         self.embed_tokens = nn.Embedding(self.config.vocab_size, self.hidden_size,
                                          padding_idx=getattr(self.config, 'pad_token_id', 0))
 
-        # Position embedding (kept for compatibility with trainer's pe.embedding_dim reference)
+        # Position embedding: 加到 token embedding 上以引入位置信息
+        # 维度必须与 hidden_size 一致才能直接相加
         head_dim = self.config.hidden_size // self.config.num_attention_heads
         max_positions = 16384 if self.config.num_encoder_layers > 1 else 2048
-        self.pe = nn.Embedding(max_positions, head_dim)
+        self.pe = nn.Embedding(max_positions, self.hidden_size)
 
         # PCAEncoder: latent projection for encoder state x -> x'
         self.encoder_latent_x_pca = nn.Linear(self.hidden_size, encoder_hidden_dim)
@@ -177,9 +178,14 @@ class MyMiniModel(nn.Module):
             logits: [B, L, vocab_size] tensor of vocabulary logits
         """
         bsz, seq_len = input_ids.shape
+        if seq_len > self.pe.num_embeddings:
+            raise ValueError(
+                f"seq_len {seq_len} 超过 position embedding 容量 {self.pe.num_embeddings}"
+            )
 
-        # 1. Token embedding -> hidden states
-        h = self.embed_tokens(input_ids)  # [B, L, hidden_size]
+        # 1. Token embedding + position embedding -> hidden states
+        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)  # [1, L]
+        h = self.embed_tokens(input_ids) + self.pe(positions)  # [B, L, hidden_size]
 
         # 2. PCA projection to latent state x'
         x_pca = self.encoder_latent_x_pca(h)  # [B, L, encoder_hidden_dim]
