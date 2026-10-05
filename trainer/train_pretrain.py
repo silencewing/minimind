@@ -35,7 +35,8 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, args, autocast_c
         labels = labels.to(args.device)
 
         with autocast_ctx:
-            logits = model(input_ids)  # [B, L, vocab_size]
+            out = model(input_ids, return_dict=True)   # 取编码器重构 aux_loss
+            logits = out.logits
 
             # 自回归语言模型损失：用上一 token 预测下一 token
             # logits[:, :-1] 预测 labels[:, 1:]
@@ -45,9 +46,19 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, args, autocast_c
                 shift_logits, shift_labels, ignore_index=-100
             )
 
-            loss = loss / args.accumulation_steps
+            # aux_loss 已乘好系数（编码器重构损失），直接相加
+            loss = (loss + out.aux_loss) / args.accumulation_steps
 
         scaler.scale(loss).backward()
+
+        # 监控共享 embedding 梯度（权重共享使其同时承受 embedding/lm_head 两侧梯度）；
+        # 除以 scaler 缩放因子还原真实尺度，仅用于日志
+        emb_grad_norm = None
+        for _n, _p in model.named_parameters():
+            if _n.endswith('embed_tokens.weight') and _p.grad is not None:
+                scale = scaler.get_scale() if hasattr(scaler, 'get_scale') else 1.0
+                emb_grad_norm = _p.grad.norm().item() / max(scale, 1.0)
+                break
 
         if step % args.accumulation_steps == 0 or step == iters:
             scaler.unscale_(optimizer)
@@ -58,9 +69,10 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, args, autocast_c
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
+            emb_txt = f' emb_g: {emb_grad_norm:.3f}' if emb_grad_norm is not None else ''
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) '
                    f'loss: {loss.item() * args.accumulation_steps:.4f} '
-                   f'time/step: {spend_time / max(step - start_step, 1):.2f}s')
+                   f'time/step: {spend_time / max(step - start_step, 1):.2f}s{emb_txt}')
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             moe_suffix = '_moe' if getattr(lm_config, 'use_moe', False) else ''
@@ -72,7 +84,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, args, autocast_c
             torch.save(state_dict, ckp)
             Logger(f"Saved checkpoint to {ckp}")
 
-        del input_ids, labels, logits, loss
+        del input_ids, labels, logits, loss, out
 
 
 def validate_orthogonality(module: nn.Module) -> float:
@@ -82,6 +94,35 @@ def validate_orthogonality(module: nn.Module) -> float:
         ortho_metric = torch.trace(w @ w.t())  # Trace(W·W^T) should ≈ dim
         return ortho_metric.item()
     return 0.0
+
+
+def build_param_groups(model: nn.Module, lr: float,
+                       weight_decay: float, embed_lr_mult: float):
+    """构建三个 AdamW 参数组：
+        1. 共享 embedding：低学习率（权重共享使梯度偏大），不做权重衰减；
+        2. 矩阵权重（dim>=2）：正常权重衰减；
+        3. RMSNorm 等 1D 参数：不做权重衰减。
+    按 data_ptr 去重，避免 tied 的 lm_head 与 embedding 被重复加入。
+    """
+    embed, decay, nodecay = [], [], []
+    seen = set()
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.data_ptr() in seen:   # tied weights 去重
+            continue
+        seen.add(p.data_ptr())
+        if n == 'embed_tokens.weight':
+            embed.append(p)
+        elif n.endswith('weight') and p.dim() >= 2:
+            decay.append(p)
+        else:
+            nodecay.append(p)
+    return [
+        {'params': embed, 'weight_decay': 0.0, 'lr': lr * embed_lr_mult},
+        {'params': decay, 'weight_decay': weight_decay},
+        {'params': nodecay, 'weight_decay': 0.0},
+    ]
 
 
 def test_model_memory(config=None):
@@ -124,7 +165,10 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=340, type=int, help="最大序列长度")
     parser.add_argument('--use_moe', action='store_true', help="是否使用 MoE")
     parser.add_argument('--seed', default=42, type=int, help="随机种子")
-    parser.add_argument('--accumulation_steps', default=1, type=int, help="梯度累积步数")
+    parser.add_argument("--accumulation_steps", default=1, type=int, help="梯度累积步数")
+    parser.add_argument("--weight_decay", default=0.01, type=float, help="权重衰减（仅作用于矩阵权重组）")
+    parser.add_argument("--embed_lr_mult", default=0.3, type=float,
+                        help="共享 embedding 参数组的学习率倍率（权重共享使其梯度偏大）")
     parser.add_argument('--grad_clip', default=1.0, type=float, help="梯度裁剪阈值")
     parser.add_argument('--log_interval', default=10, type=int, help="日志打印间隔 step")
     parser.add_argument('--save_interval', default=200, type=int, help="权重保存间隔 step")
@@ -222,7 +266,10 @@ if __name__ == "__main__":
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device_type == "cuda" and args.dtype == "bfloat16"))
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95))
+    param_groups = build_param_groups(
+        model, args.learning_rate, args.weight_decay, args.embed_lr_mult,
+    )
+    optimizer = optim.AdamW(param_groups, lr=args.learning_rate, betas=(0.9, 0.95))
 
     # ========== 7. 从 ckp 恢复状态（自动续训）==========
     start_epoch, start_step = 0, 0

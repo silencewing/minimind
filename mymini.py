@@ -1,140 +1,303 @@
+"""
+MyMini —— 编码器-解码器语言模型（minimind 训练体系兼容）
+
+架构设计（对应 prompt.md 的研究假设）：
+    1. 编码器：x -> x' -> x
+       瓶颈结构（PCA / word2vec 风格）：
+         - 降维矩阵 W 与重构矩阵 W^T 权重转置绑定（PCA 对称重构语义）；
+         - 潜在空间经 SiLU 非线性（autoencoder / word2vec 风格）；
+         - 重构增益（补偿 SiLU 斜率与转置投影能量损失）使初始重构近似保范数，
+           避免多层串联信号衰减；
+         - 每个瓶颈块附带重构辅助损失（recon_loss_coef），强迫 x' 保留输入信息；
+         - 可堆叠 num_encoder_layers 个瓶颈块。
+    2. 解码器：x -> (x + x') 上的注意力模型 -> x+1
+         - GQA 分组查询注意力 + RoPE 旋转位置编码；
+         - 注意力权重不调用 softmax，采用 log 域裁剪 + log-sum-exp 归一化：
+           权重严格落在概率单纯形上，且任意两个 log 权重之差被显式截断，
+           避免分值相差过大导致的梯度爆炸；
+         - 解码块采用 Pre-LN + RMSNorm + SwiGLU FFN。
+    3. 多头 Q/K/V/O 投影按头做正交初始化（每个头的投影行向量构成标准正交基）。
+    4. 默认配置训练显存 < 12GB（梯度检查点 + GQA + bf16），内存 < 10GB。
+
+训练入口：trainer/train_pretrain.py（model(input_ids) -> logits）。
+兼容 SFT：model(input_ids, labels=labels) -> CausalLMOutput(.loss/.logits/.aux_loss)。
+"""
+
 import math
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Optional, Tuple, List
-from dataclasses import *
 
 
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                                     Config
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 @dataclass
 class MiniMindConfig:
-    """MiniMind Config with RoPE attention and PCA encoder"""
-    hidden_size: int = 1024          # hidden dimension (adjustable)
-    encoder_hidden_dim: int = 512    # PCA projection dim after encoding
+    """MyMini 配置（字段名与 trainer/train_pretrain.py 的构造参数对齐）"""
+    hidden_size: int = 1024          # 隐藏维度
+    encoder_hidden_dim: int = 512    # 编码器瓶颈（x'）维度，推荐 hidden_size / 2
     num_attention_heads: int = 8
-    num_kv_heads: int = 4
-    num_encoder_layers: int = 4
+    num_kv_heads: int = 4            # GQA：KV 头数，需整除 num_attention_heads
+    num_encoder_layers: int = 4      # 瓶颈块数量（x->x'->x 堆叠次数）
     num_decoder_layers: int = 12
     vocab_size: int = 6400           # 词表大小，需与 tokenizer 一致
-    use_moe: bool = False            # 是否启用 MoE（保留字段以兼容 lm_checkpoint）
+    use_moe: bool = False            # 保留字段：checkpoint 命名/续训逻辑依赖
+    dropout: float = 0.0
+    intermediate_size: int = 0       # SwiGLU 中间维度，0 表示自动计算
+    max_position_embeddings: int = 8192
+    rope_theta: float = 1e6
+    rms_norm_eps: float = 1e-6
+    log_clip: float = 4.0            # log 注意力分值截断半径（权重比 ≤ e^(2·clip)）
+    recon_loss_coef: float = 0.1     # 编码器重构辅助损失权重（0 = 关闭）
+    gradient_checkpointing: bool = True  # 训练时重算激活换显存（12GB 预算的关键开关）
     bos_token_id: int = 1
     eos_token_id: int = 2
     pad_token_id: int = 0
 
+    def __post_init__(self):
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_size({self.hidden_size}) 必须能被 "
+                f"num_attention_heads({self.num_attention_heads}) 整除"
+            )
+        if self.num_attention_heads % self.num_kv_heads != 0:
+            raise ValueError(
+                f"num_attention_heads({self.num_attention_heads}) 必须能被 "
+                f"num_kv_heads({self.num_kv_heads}) 整除"
+            )
+        if not (0 < self.encoder_hidden_dim <= self.hidden_size):
+            raise ValueError("encoder_hidden_dim 必须满足 0 < encoder_hidden_dim <= hidden_size")
+        if self.intermediate_size <= 0:
+            # Llama 风格 SwiGLU 比例（约 2.67×hidden，按 64 对齐）
+            self.intermediate_size = math.ceil(self.hidden_size * 8 / 3 / 64) * 64
 
-def init_orthogonal(module: nn.Module, dim: Optional[int] = None):
-    """随机正交基初始化（修复：原 QR 在 (1, N) 上结果退化成标量）"""
+
+@dataclass
+class CausalLMOutput:
+    """轻量输出容器（SFT 等需要内部算损失的场景使用）。
+    aux_loss 已乘好系数，调用方按 minimind 惯例直接 loss + aux_loss。"""
+    loss: Optional[Tensor] = None
+    logits: Optional[Tensor] = None
+    aux_loss: Optional[Tensor] = None
+    hidden_states: Optional[Tensor] = None
+
+
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                                  通用工具 / 初始化
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+def init_orthogonal(module: nn.Module, gain: float = 1.0):
+    """对 nn.Linear 做正交初始化（保留该公开函数供训练脚本导入/校验）"""
     if isinstance(module, nn.Linear) and module.weight.dim() == 2:
-        # 直接使用 PyTorch 内置正交初始化，避免手写 QR 的形状 bug
-        nn.init.orthogonal_(module.weight)
+        nn.init.orthogonal_(module.weight, gain=gain)
         if module.bias is not None:
             module.bias.data.zero_()
 
 
-class PCAEncoder(nn.Module):
-    """基于线性投影的 PCA 编码器：hidden -> encoder_hidden_dim -> head_dim
+def _orthogonal_per_heads(weight: Tensor, num_heads: int, head_dim: int):
+    """按头正交初始化。
 
-    返回:
-        combined  : [B, L, head_dim]     —— 低/高路合并的解码输出
-        x_pca     : [B, L, encoder_hidden_dim] —— PCA 瓶颈表示，供解码层融合
+    将 [num_heads*head_dim, in_dim] 的权重按头切片，对每个头的
+    [head_dim, in_dim] 子矩阵做正交化：每个头的投影行向量两两标准正交，
+    且不同头从独立正交基中采样，保证多头之间初始方向互不相关。
+    """
+    with torch.no_grad():
+        w = weight.view(num_heads, head_dim, -1)
+        for i in range(num_heads):
+            nn.init.orthogonal_(w[i])
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        norm = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (self.weight * norm.float()).type_as(x)
+
+
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                                       RoPE
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+def precompute_freqs_cis(dim: int, end: int, theta: float = 1e6) -> Tuple[Tensor, Tensor]:
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    freqs = torch.outer(torch.arange(end, dtype=torch.float32), freqs)
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+    return freqs_cos, freqs_sin
+
+
+def apply_rotary_pos_emb(q: Tensor, k: Tensor,
+                         cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
+    """q, k: [B, H, L, head_dim]；cos/sin: [L, head_dim]"""
+    def rotate_half(x: Tensor) -> Tensor:
+        half = x.shape[-1] // 2
+        return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    q_out = (q * cos + rotate_half(q) * sin).to(q.dtype)
+    k_out = (k * cos + rotate_half(k) * sin).to(k.dtype)
+    return q_out, k_out
+
+
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                                编码器：x -> x' -> x
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+class BottleneckBlock(nn.Module):
+    """单个 PCA/word2vec 风格瓶颈块：
+        z  = SiLU(W x)        —— 编码到低维潜在空间 x'
+        xr = g·W^T z          —— 用转置权重重构回 x（PCA 对称语义）
+
+    重构增益 g = 2·sqrt(hidden/latent) 同时补偿两个初始衰减因子：
+      1. SiLU 在零点附近斜率≈0.5（因子 2）；
+      2. 转置投影 W^T W 只保留 latent 维行空间，各向同性输入下每块
+         仅保留 latent/hidden 的能量（因子 sqrt(hidden/latent)）。
+    两者叠加会使多块串联后重构信号衰减为零（无增益时 4 块堆叠实测
+    ||x_rec||/||x||≈0.02，编码器成为死支路）。补偿后初始重构近似保范数；
+    重构损失随后驱动 W 的行空间对齐输入的高能量方向（PCA 语义）。
     """
 
-    def __init__(self, hidden_size, encoder_hidden_dim, num_attention_heads):
+    def __init__(self, hidden_size: int, latent_dim: int):
         super().__init__()
-        self.encoder_latent_x_pca = nn.Linear(hidden_size, encoder_hidden_dim)
-        head_dim = hidden_size // num_attention_heads
-        self.dec_proj_l = nn.Linear(encoder_hidden_dim, head_dim)
-        self.dec_proj_h = nn.Linear(encoder_hidden_dim, head_dim)
-        init_orthogonal(self.dec_proj_l)
-        init_orthogonal(self.dec_proj_h)
+        self.down = nn.Linear(hidden_size, latent_dim, bias=False)
+        self.recon_gain = 2.0 * math.sqrt(hidden_size / latent_dim)
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        x_pca = self.encoder_latent_x_pca(x)                # [B, L, encoder_hidden_dim]
-        x_dec_l = self.dec_proj_l(x_pca)                    # [B, L, head_dim]
-        x_dec_h = self.dec_proj_h(x_pca)                    # [B, L, head_dim]
-        return x_dec_l + x_dec_h, x_pca
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        z = F.silu(self.down(x))                    # [B, L, latent]
+        x_rec = self.recon_gain * F.linear(z, self.down.weight.t())  # [B, L, hidden]
+        # 重构损失：目标为该块输入（stop-grad），强迫瓶颈保留输入信息
+        recon = F.mse_loss(x_rec, x.detach())
+        return x_rec, z, recon
 
 
-class LogAttention(nn.Module):
-    """Log-Attention：用 log-sum-exp 替代 softmax，避免数值溢出"""
+class PCAEncoder(nn.Module):
+    """堆叠 num_encoder_layers 个瓶颈块。
 
-    def __init__(self, head_dim: int):
-        super().__init__()
-        self.head_dim = head_dim
-        self.scale = 1.0 / math.sqrt(head_dim)
-
-    def forward(self, q: Tensor, k: Tensor, v: Tensor,
-               mask: Optional[Tensor] = None) -> Tensor:
-        """
-        Args:
-            q, k, v : [B, H, L, head_dim]
-            mask    : [1, 1, L, L] 因果掩码（可选）
-        Returns:
-            output   : [B, H, L, head_dim]
-        """
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, L, L]
-
-        if mask is not None:
-            scores = scores + mask
-
-        # 稳定的 log-sum-exp → 归一化权重
-        max_log_w = torch.max(scores, dim=-1, keepdim=True).values
-        log_w = scores - max_log_w
-        weights = torch.exp(log_w)
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
-
-        # SiLU 截断门控（保留原设计的 SiLU 激活思想）
-        z = scores / self.head_dim
-        gate = torch.sigmoid(z - 3.0)
-        weights = weights * gate
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
-
-        output = torch.matmul(weights, v)  # [B, H, L, head_dim]
-        return output
-
-
-class MixedAttentionLayer(nn.Module):
-    """解码层：自注意力 (LogAttention) + 残差门控 + LayerNorm
-
-    修复:
-      - 原代码 residual(64) + encoder_fusion(32) 维度不匹配
-      - 原代码未真正使用 attention，只是 nn.functional.layer_norm
-      - 现在把 encoder_reprs_x_pca 投影回 hidden_size 再相加
+    返回:
+        x_rec : [B, L, hidden_size]  最后一块的重构表示（解码器与之残差融合）
+        z     : [B, L, latent_dim]   最后一块的潜在表示 x'（信息瓶颈）
     """
 
     def __init__(self, config: MiniMindConfig):
         super().__init__()
-        self.config = config
+        self.blocks = nn.ModuleList([
+            BottleneckBlock(config.hidden_size, config.encoder_hidden_dim)
+            for _ in range(config.num_encoder_layers)
+        ])
+        # 降维矩阵按"主成分"方向正交初始化（W W^T = I_latent）
+        for block in self.blocks:
+            nn.init.orthogonal_(block.down.weight)
+
+    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        recon_loss = x.new_zeros(())
+        h, z = x, None
+        for block in self.blocks:
+            h, z, r = block(h)
+            recon_loss = recon_loss + r          # 各块重构损失求和
+        return h, z, recon_loss
+
+
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                       解码器注意力：log 域归一化（不使用 softmax）
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+class LogAttention(nn.Module):
+    """Log-Attention：log 域裁剪 + log-sum-exp 归一化。
+
+    与直接 softmax(qk^T) 的区别：
+      1. 不调用 softmax；归一化完全在 log 域手工完成（减最大值后 exp）；
+      2. 分值先截断到 [-log_clip, log_clip]：任意两个 log 权重之差
+         ≤ 2·log_clip，最大/最小权重比被钉死在 e^(2·log_clip) 以内，
+         从机制上保证输出是"彼此差距有界"的概率分布，避免分值发散
+         造成的梯度消失/爆炸；
+      3. 掩码位置以 -inf 精确置零，归一化计算在 float32 下进行。
+    """
+
+    def __init__(self, head_dim: int, log_clip: float = 4.0):
+        super().__init__()
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5
+        self.log_clip = log_clip
+
+    def forward(self, q: Tensor, k: Tensor, v: Tensor,
+                attn_mask: Optional[Tensor] = None) -> Tensor:
+        """
+        Args:
+            q, k, v  : [B, H, L, head_dim]
+            attn_mask: [1, 1, L, L] bool，True 表示允许注意
+        Returns:
+            output   : [B, H, L, head_dim]
+        """
+        # log 域：先缩放，再做有界截断（关键的防梯度爆炸约束）
+        logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        logits = logits.clamp(-self.log_clip, self.log_clip)
+
+        if attn_mask is not None:
+            logits = logits.masked_fill(~attn_mask, float('-inf'))
+
+        # log-sum-exp 归一化（float32）。因果掩码下每行至少有自身，max 有限。
+        logits_fp = logits.float()
+        max_log = logits_fp.max(dim=-1, keepdim=True).values
+        weights = torch.exp(logits_fp - max_log)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+
+        return torch.matmul(weights, v.float()).to(v.dtype)
+
+
+def create_causal_mask(seq_len: int, device=None) -> Tensor:
+    """因果布尔掩码 [1, 1, L, L]，下三角（含对角）为 True"""
+    mask = torch.ones(seq_len, seq_len, device=device, dtype=torch.bool).tril()
+    return mask.view(1, 1, seq_len, seq_len)
+
+
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                                   解码块
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+class DecoderLayer(nn.Module):
+    """Pre-LN 解码块：GQA(LogAttention) + 残差 + RMSNorm + SwiGLU"""
+
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
         dim = config.hidden_size
         self.num_heads = config.num_attention_heads
-        head_dim = dim // self.num_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.head_dim = dim // self.num_heads
+        kv_dim = self.head_dim * self.num_kv_heads
 
-        # Q/K/V 投影（用 GQA：num_kv_heads < num_heads 时共享）
-        self.num_kv_heads = min(config.num_kv_heads, self.num_heads)
-        kv_dim = head_dim * self.num_kv_heads
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, kv_dim, bias=False)
         self.v_proj = nn.Linear(dim, kv_dim, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
 
-        self.attention = LogAttention(head_dim)
+        # 多头正交初始化：Q/O 按注意力头、K/V 按 KV 头切分
+        _orthogonal_per_heads(self.q_proj.weight, self.num_heads, self.head_dim)
+        _orthogonal_per_heads(self.k_proj.weight, self.num_kv_heads, self.head_dim)
+        _orthogonal_per_heads(self.v_proj.weight, self.num_kv_heads, self.head_dim)
+        _orthogonal_per_heads(self.o_proj.weight, self.num_heads, self.head_dim)
 
-        # 把 encoder 的 PCA 表示投影回 hidden_size 用于残差融合
-        self.enc_proj = nn.Linear(config.encoder_hidden_dim, dim)
+        self.attention = LogAttention(self.head_dim, log_clip=config.log_clip)
 
-        # FFN + 残差门控
-        self.res_gate = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.GELU(),
-            nn.Linear(dim * 2, dim),
-            nn.Dropout(0.1),
-        )
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm1 = RMSNorm(dim, eps=config.rms_norm_eps)
+        self.norm2 = RMSNorm(dim, eps=config.rms_norm_eps)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        # SwiGLU FFN: down(SiLU(gate(x)) * up(x))
+        self.gate_proj = nn.Linear(dim, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(dim, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, dim, bias=False)
+
+        # FFN 小尺度初始化（注意力保持正交，FFN 负责可控的小幅残差更新）
+        nn.init.normal_(self.gate_proj.weight, std=0.02)
+        nn.init.normal_(self.up_proj.weight, std=0.02)
+        nn.init.normal_(self.down_proj.weight, std=0.02)
 
     def _repeat_kv(self, x: Tensor) -> Tensor:
-        """GQA: 把 kv 头复制到与 q 头数一致"""
         bsz, kv_heads, seq, head_dim = x.shape
         if kv_heads == self.num_heads:
             return x
@@ -142,149 +305,227 @@ class MixedAttentionLayer(nn.Module):
         return x[:, :, None, :, :].expand(bsz, kv_heads, n_rep, seq, head_dim) \
                                   .reshape(bsz, self.num_heads, seq, head_dim)
 
-    def forward(self, x: Tensor,
-                encoder_reprs_x_pca: Optional[Tensor] = None,
+    def _attn(self, x: Tensor, cos: Tensor, sin: Tensor,
+              attn_mask: Optional[Tensor]) -> Tensor:
+        bsz, seq_len, _ = x.shape
+        q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        k, v = self._repeat_kv(k), self._repeat_kv(v)
+        out = self.attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        return self.resid_dropout(self.o_proj(out))
+
+    def _ffn(self, x: Tensor) -> Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
                 attn_mask: Optional[Tensor] = None) -> Tensor:
-        """
-        Args:
-            x                     : [B, L, hidden_size]
-            encoder_reprs_x_pca   : [B, L, encoder_hidden_dim]  (可选)
-            attn_mask             : [1, 1, L, L]                 (可选)
-        """
-        bsz, seq_len, dim = x.shape
-        head_dim = dim // self.num_heads
-
-        q = self.q_proj(x).view(bsz, seq_len, self.num_heads, head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, head_dim).transpose(1, 2)
-        k = self._repeat_kv(k)
-        v = self._repeat_kv(v)
-
-        attn_out = self.attention(q, k, v, mask=attn_mask)  # [B, H, L, head_dim]
-        attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, dim)
-        attn_out = self.o_proj(attn_out)
-
-        # 残差 + LayerNorm (自注意力子层)
-        out = self.norm1(x + attn_out)
-
-        # 融合 encoder PCA 表示（投影到 hidden_size 后相加）
-        if encoder_reprs_x_pca is not None:
-            enc = self.enc_proj(encoder_reprs_x_pca)
-            out = out + enc
-
-        # FFN + 残差 + LayerNorm
-        out = self.norm2(out + self.res_gate(out))
-        return out
+        x = x + self._attn(self.norm1(x), cos, sin, attn_mask)
+        x = x + self.resid_dropout(self._ffn(self.norm2(x)))
+        return x
 
 
-def create_attention_mask(seq_len: int, device=None) -> Tensor:
-    """生成因果掩码 [1, 1, L, L]，上三角为 -inf"""
-    mask = torch.full((seq_len, seq_len), float('-inf'), device=device)
-    mask = torch.triu(mask, diagonal=1)
-    return mask.view(1, 1, seq_len, seq_len)
-
-
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                                   整体模型
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 class MyMiniModel(nn.Module):
-    """Encoder-Decoder：PCAEncoder + N×MixedAttentionLayer + LM Head
+    """编码器-解码器：
 
-    架构:
-        1. Token + Position Embedding
-        2. PCAEncoder       —— 降维瓶颈，提取主成分
-        3. N × MixedAttentionLayer —— 带 LogAttention 的解码层
-        4. LayerNorm + LM Head   —— 输出词表 logits
+        tokens -> Embedding
+               -> PCAEncoder: x -> x' -> x_rec
+               -> x + x_rec（解码器在"原始信息 + 瓶颈重构信息"上工作）
+               -> N × DecoderLayer(GQA + LogAttention + SwiGLU)
+               -> RMSNorm -> tied LM Head -> logits
     """
 
     def __init__(self, config: Optional[MiniMindConfig] = None):
         super().__init__()
-        self.config = MiniMindConfig() if config is None else config
-        self.hidden_size = self.config.hidden_size
-        num_heads = self.config.num_attention_heads
-        head_dim = self.hidden_size // num_heads
+        self.config = config if config is not None else MiniMindConfig()
 
-        # 1. Token + Position Embedding
+        dim = self.config.hidden_size
+        head_dim = dim // self.config.num_attention_heads
+
+        # Token Embedding（padding 行不参与更新）
         self.embed_tokens = nn.Embedding(
-            self.config.vocab_size, self.hidden_size,
-            padding_idx=self.config.pad_token_id,
-        )
-        max_positions = 16384 if self.config.num_encoder_layers > 1 else 2048
-        self.pe = nn.Embedding(max_positions, self.hidden_size)
-
-        # 2. PCA Encoder
-        self.pca_encoder = PCAEncoder(
-            self.hidden_size, self.config.encoder_hidden_dim, num_heads,
+            self.config.vocab_size, dim, padding_idx=self.config.pad_token_id,
         )
 
-        # 3. 把 PCA 的 head_dim 输出投影回 hidden_size 给解码层
-        self.enc_to_hidden = nn.Linear(head_dim, self.hidden_size)
-        self.enc_norm = nn.LayerNorm(self.hidden_size)
+        # 编码器 x -> x' -> x
+        self.pca_encoder = PCAEncoder(self.config)
 
-        # 4. N 层 MixedAttentionLayer 解码层
+        # 解码器入口：x + x' 的融合归一化
+        self.enc_norm = RMSNorm(dim, eps=self.config.rms_norm_eps)
+        self.embed_dropout = nn.Dropout(self.config.dropout)
+
+        # 解码层
         self.decoder_layers = nn.ModuleList([
-            MixedAttentionLayer(self.config)
-            for _ in range(self.config.num_decoder_layers)
+            DecoderLayer(self.config) for _ in range(self.config.num_decoder_layers)
         ])
 
-        # 5. 输出 LayerNorm + LM Head（与 embed_tokens 权重共享）
-        self.layer_norm = nn.LayerNorm(self.hidden_size)
-        self.lm_head = nn.Linear(self.hidden_size, self.config.vocab_size, bias=False)
-        self.embed_tokens.weight = self.lm_head.weight
+        # 输出归一化 + LM Head
+        self.norm = RMSNorm(dim, eps=self.config.rms_norm_eps)
+        self.lm_head = nn.Linear(dim, self.config.vocab_size, bias=False)
+        # 权重共享：方向为 lm_head -> embedding（保留 embedding 的 padding_idx 语义）
+        self.lm_head.weight = self.embed_tokens.weight
+        # 小尺度初始化嵌入矩阵（默认 N(0,1) 会使初始 logits 过大、CE 远超 ln(vocab)）；
+        # 共享后 lm_head 同步生效，pad 行保持零
+        nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.embed_tokens.weight[self.config.pad_token_id].zero_()
 
-    def forward(self, input_ids: Tensor) -> Tensor:
+        # RoPE 频率（非持久 buffer，不进 checkpoint，由数据类型/设备动态适配）
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            head_dim, self.config.max_position_embeddings, self.config.rope_theta,
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(self, input_ids: Tensor,
+                labels: Optional[Tensor] = None,
+                return_dict: bool = False):
         """
         Args:
-            input_ids: [B, L] long
+            input_ids   : [B, L] long
+            labels      : [B, L] long，可选；给出时内部计算 shift CE 损失
+            return_dict : True 时即使无 labels 也返回 CausalLMOutput
+                          （供训练脚本取 aux_loss）
         Returns:
-            logits: [B, L, vocab_size]
+            无 labels 且 return_dict=False : logits [B, L, vocab_size]
+            否则 : CausalLMOutput(loss/logits/aux_loss/hidden_states)
         """
-        bsz, seq_len = input_ids.shape
-        if seq_len > self.pe.num_embeddings:
+        seq_len = input_ids.shape[1]
+        if seq_len > self.config.max_position_embeddings:
             raise ValueError(
-                f"seq_len {seq_len} 超过 position embedding 容量 {self.pe.num_embeddings}"
+                f"seq_len {seq_len} 超过最大位置长度 "
+                f"{self.config.max_position_embeddings}"
             )
 
-        # 1. Embedding + Position
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
-        h = self.embed_tokens(input_ids) + self.pe(positions)  # [B, L, hidden]
+        # 1. Token Embedding
+        h = self.embed_dropout(self.embed_tokens(input_ids))  # [B, L, hidden]
 
-        # 2. PCA Encoder: h -> combined(head_dim) + x_pca(encoder_hidden_dim)
-        combined, x_pca = self.pca_encoder(h)
+        # 2. 编码器 x -> x' -> x_rec（同时得到各块重构损失之和）
+        x_rec, _z, recon_loss = self.pca_encoder(h)
 
-        # 3. 投影回 hidden_size
-        dec_in = self.enc_norm(self.enc_to_hidden(combined) + h)
+        # 3. 解码器入口：x + x'
+        dec_in = self.enc_norm(h + x_rec)
 
-        # 4. 因果掩码
-        attn_mask = create_attention_mask(seq_len, device=input_ids.device)
+        # 4. RoPE 与因果掩码
+        cos = self.freqs_cos[:seq_len].to(input_ids.device)
+        sin = self.freqs_sin[:seq_len].to(input_ids.device)
+        attn_mask = create_causal_mask(seq_len, device=input_ids.device)
 
-        # 5. 解码层
+        # 5. 解码层（训练时可选梯度检查点，将激活显存从 O(L·N) 降到 O(L)）
+        use_ckpt = (
+            self.training
+            and self.config.gradient_checkpointing
+            and input_ids.is_cuda
+        )
         for layer in self.decoder_layers:
-            dec_in = layer(dec_in, encoder_reprs_x_pca=x_pca, attn_mask=attn_mask)
+            if use_ckpt:
+                dec_in = torch.utils.checkpoint.checkpoint(
+                    layer, dec_in, cos, sin, attn_mask,
+                    use_reentrant=False,
+                )
+            else:
+                dec_in = layer(dec_in, cos, sin, attn_mask)
 
-        out = self.layer_norm(dec_in)
-        logits = self.lm_head(out)  # [B, L, vocab_size]
-        return logits
+        # 6. 输出
+        hidden_states = self.norm(dec_in)
+        logits = self.lm_head(hidden_states)
+
+        # 编码器重构辅助损失（系数已乘好，调用方直接相加）
+        aux_loss = self.config.recon_loss_coef * recon_loss
+
+        if labels is None and not return_dict:
+            return logits
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous().view(-1, self.config.vocab_size)
+            shift_labels = labels[:, 1:].contiguous().view(-1)
+            loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+
+        return CausalLMOutput(
+            loss=loss, aux_loss=aux_loss, logits=logits,
+            hidden_states=hidden_states,
+        )
 
 
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                                    测试
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 def test_basic():
-    """基本测试：验证模型可创建、前向可跑、所有参数都参与损失（DDP 安全）"""
+    """接口 / DDP 安全 / 因果性 / 正交性 / 损失模式 综合测试"""
     config = MiniMindConfig(
         hidden_size=64, encoder_hidden_dim=32,
+        num_attention_heads=8, num_kv_heads=4,
         num_encoder_layers=2, num_decoder_layers=2,
-        num_attention_heads=8, vocab_size=100,
+        vocab_size=100, max_position_embeddings=512,
+        gradient_checkpointing=False,
     )
     model = MyMiniModel(config)
-    print("Model created. params:", sum(p.numel() for p in model.parameters()))
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model created. params: {n_params}")
 
     x = torch.randint(0, config.vocab_size, (2, 16), dtype=torch.long)
+
+    # --- 1) 预训练契约：forward -> logits ---
     logits = model(x)
+    assert tuple(logits.shape) == (2, 16, config.vocab_size)
+    assert torch.isfinite(logits).all()
     print(f"Forward OK. logits: {tuple(logits.shape)}")
 
-    # 检查是否有未参与损失的参数（DDP 兼容性）
-    loss = logits.sum()
+    # --- 1b) 编码器非死支路：重构尺度必须与输入同量级 ---
+    with torch.no_grad():
+        emb = model.embed_tokens(x)
+        x_rec, _z, recon_sum = model.pca_encoder(emb)
+    ratio = (x_rec.norm() / emb.norm()).item()
+    assert 0.5 <= ratio <= 2.0, f"重构尺度异常 ||x_rec||/||x||={ratio:.3f}"
+    assert recon_sum.item() > 0, "重构损失应非零（瓶颈秩 < hidden）"
+    print(f"Encoder scale OK — ||x_rec||/||x||={ratio:.3f} ✓")
+
+    # --- 2) DDP 安全：所有参数都参与损失（CE + 重构损失）---
+    out_d = model(x, return_dict=True)
+    loss = logits.sum() + out_d.aux_loss
     loss.backward()
     unused = [n for n, p in model.named_parameters() if p.grad is None]
-    print(f"Unused params (DDP-unsafe): {unused}")
-    assert not unused, f"DDP will fail: {unused}"
+    assert not unused, f"DDP will fail on unused params: {unused}"
     print("All params participate in loss — DDP safe ✓")
+
+    # --- 3) SFT 契约：labels -> CausalLMOutput，aux_loss 含重构项 ---
+    model.zero_grad(set_to_none=True)
+    labels = x.clone()
+    out = model(x, labels=labels)
+    assert out.loss is not None and torch.isfinite(out.loss)
+    assert out.aux_loss.item() > 0 and torch.isfinite(out.aux_loss).all()
+    (out.loss + out.aux_loss).backward()
+    print(f"Labels mode OK. loss: {out.loss.item():.4f}, "
+          f"recon_aux: {out.aux_loss.item():.5f} ✓")
+
+    # --- 4) 因果性：扰动未来 token 不影响当前位置输出 ---
+    model.eval()
+    x2 = x.clone()
+    x2[0, 10:] = torch.randint(0, config.vocab_size, (6,))
+    with torch.no_grad():
+        l1 = model(x)
+        l2 = model(x2)
+    assert torch.allclose(l1[0, :10], l2[0, :10], atol=1e-5), "因果掩码失效"
+    print("Causality OK — future tokens do not affect present logits ✓")
+
+    # --- 5) 多头正交初始化：每个头 W_i W_i^T ≈ I ---
+    w = model.decoder_layers[0].q_proj.weight.view(8, 8, 64)
+    for i in range(8):
+        eye = w[i] @ w[i].t()
+        assert torch.allclose(eye, torch.eye(8), atol=1e-5), f"head {i} 非正交"
+    print("Per-head orthogonal init OK ✓")
+
+    # --- 6) 权重共享：embedding 与 lm_head 是同一块存储 ---
+    assert model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr()
+    print("Tied embeddings OK ✓")
+
+    print("\nAll tests passed ✓")
 
 
 if __name__ == "__main__":
