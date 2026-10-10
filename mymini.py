@@ -85,6 +85,7 @@ class CausalLMOutput:
     logits: Optional[Tensor] = None
     aux_loss: Optional[Tensor] = None
     hidden_states: Optional[Tensor] = None
+    past_key_values: Optional[Tuple[Tuple[Tensor, Tensor], ...]] = None
 
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
@@ -306,25 +307,39 @@ class DecoderLayer(nn.Module):
                                   .reshape(bsz, self.num_heads, seq, head_dim)
 
     def _attn(self, x: Tensor, cos: Tensor, sin: Tensor,
-              attn_mask: Optional[Tensor]) -> Tensor:
+              attn_mask: Optional[Tensor],
+              past_key_value: Optional[Tuple[Tensor, Tensor]] = None,
+              use_cache: bool = False) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
         bsz, seq_len, _ = x.shape
         q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # RoPE 作用于新 token 的 q/k（cos/sin 已按绝对位置切片）
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # 拼接历史缓存（缓存中存的是 RoPE 之后的 k）
+        if past_key_value is not None:
+            k = torch.cat([past_key_value[0], k], dim=2)
+            v = torch.cat([past_key_value[1], v], dim=2)
+        present = (k, v) if use_cache else None
+
         k, v = self._repeat_kv(k), self._repeat_kv(v)
         out = self.attention(q, k, v, attn_mask=attn_mask)
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
-        return self.resid_dropout(self.o_proj(out))
+        return self.resid_dropout(self.o_proj(out)), present
 
     def _ffn(self, x: Tensor) -> Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
-                attn_mask: Optional[Tensor] = None) -> Tensor:
-        x = x + self._attn(self.norm1(x), cos, sin, attn_mask)
+                attn_mask: Optional[Tensor] = None,
+                past_key_value: Optional[Tuple[Tensor, Tensor]] = None,
+                use_cache: bool = False) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
+        attn_out, present = self._attn(self.norm1(x), cos, sin, attn_mask,
+                                       past_key_value, use_cache)
+        x = x + attn_out
         x = x + self.resid_dropout(self._ffn(self.norm2(x)))
-        return x
+        return x, present
 
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
@@ -384,26 +399,32 @@ class MyMiniModel(nn.Module):
 
     def forward(self, input_ids: Tensor,
                 labels: Optional[Tensor] = None,
-                return_dict: bool = False):
+                return_dict: bool = False,
+                past_key_values: Optional[Tuple[Tuple[Tensor, Tensor], ...]] = None,
+                use_cache: bool = False):
         """
         Args:
-            input_ids   : [B, L] long
-            labels      : [B, L] long，可选；给出时内部计算 shift CE 损失
-            return_dict : True 时即使无 labels 也返回 CausalLMOutput
-                          （供训练脚本取 aux_loss）
+            input_ids       : [B, L] long（增量推理时为 [B, L_new]）
+            labels          : [B, L] long，可选；给出时内部计算 shift CE 损失
+            return_dict     : True 时即使无 labels 也返回 CausalLMOutput
+            past_key_values : 各层缓存 (k, v)，k/v 为 [B, H_kv, L_past, head_dim]
+                              （存的是 RoPE 之后的值）
+            use_cache       : True 时在输出中返回更新后的 past_key_values
         Returns:
             无 labels 且 return_dict=False : logits [B, L, vocab_size]
-            否则 : CausalLMOutput(loss/logits/aux_loss/hidden_states)
+            否则 : CausalLMOutput(loss/logits/aux_loss/hidden_states/past_key_values)
         """
         seq_len = input_ids.shape[1]
-        if seq_len > self.config.max_position_embeddings:
+        past_len = 0 if past_key_values is None else past_key_values[0][0].shape[2]
+        total_len = past_len + seq_len
+        if total_len > self.config.max_position_embeddings:
             raise ValueError(
-                f"seq_len {seq_len} 超过最大位置长度 "
+                f"总长度 {total_len} 超过最大位置长度 "
                 f"{self.config.max_position_embeddings}"
             )
 
-        # 1. Token Embedding
-        h = self.embed_dropout(self.embed_tokens(input_ids))  # [B, L, hidden]
+        # 1. Token Embedding（编码器只处理新 token）
+        h = self.embed_dropout(self.embed_tokens(input_ids))  # [B, L_new, hidden]
 
         # 2. 编码器 x -> x' -> x_rec（同时得到各块重构损失之和）
         x_rec, _z, recon_loss = self.pca_encoder(h)
@@ -411,25 +432,37 @@ class MyMiniModel(nn.Module):
         # 3. 解码器入口：x + x'
         dec_in = self.enc_norm(h + x_rec)
 
-        # 4. RoPE 与因果掩码
-        cos = self.freqs_cos[:seq_len].to(input_ids.device)
-        sin = self.freqs_sin[:seq_len].to(input_ids.device)
-        attn_mask = create_causal_mask(seq_len, device=input_ids.device)
+        # 4. RoPE（按绝对位置切片）与因果掩码
+        cos = self.freqs_cos[past_len:total_len].to(input_ids.device)
+        sin = self.freqs_sin[past_len:total_len].to(input_ids.device)
+        if past_len > 0:
+            # 增量推理：新 token 对所有历史位置可见
+            attn_mask = torch.ones(
+                seq_len, total_len, device=input_ids.device, dtype=torch.bool,
+            ).tril(diagonal=past_len).view(1, 1, seq_len, total_len)
+        else:
+            attn_mask = create_causal_mask(seq_len, device=input_ids.device)
 
         # 5. 解码层（训练时可选梯度检查点，将激活显存从 O(L·N) 降到 O(L)）
         use_ckpt = (
             self.training
             and self.config.gradient_checkpointing
             and input_ids.is_cuda
+            and not use_cache
         )
-        for layer in self.decoder_layers:
+        presents = []
+        for i, layer in enumerate(self.decoder_layers):
+            layer_past = past_key_values[i] if past_key_values is not None else None
             if use_ckpt:
-                dec_in = torch.utils.checkpoint.checkpoint(
+                dec_in, _ = torch.utils.checkpoint.checkpoint(
                     layer, dec_in, cos, sin, attn_mask,
                     use_reentrant=False,
                 )
             else:
-                dec_in = layer(dec_in, cos, sin, attn_mask)
+                dec_in, present = layer(dec_in, cos, sin, attn_mask,
+                                        layer_past, use_cache)
+                if use_cache:
+                    presents.append(present)
 
         # 6. 输出
         hidden_states = self.norm(dec_in)
@@ -438,7 +471,7 @@ class MyMiniModel(nn.Module):
         # 编码器重构辅助损失（系数已乘好，调用方直接相加）
         aux_loss = self.config.recon_loss_coef * recon_loss
 
-        if labels is None and not return_dict:
+        if labels is None and not return_dict and not use_cache:
             return logits
 
         loss = None
@@ -450,7 +483,44 @@ class MyMiniModel(nn.Module):
         return CausalLMOutput(
             loss=loss, aux_loss=aux_loss, logits=logits,
             hidden_states=hidden_states,
+            past_key_values=tuple(presents) if use_cache else None,
         )
+
+    @torch.no_grad()
+    def generate(self, input_ids: Tensor, max_new_tokens: int = 64,
+                 temperature: float = 1.0, top_p: float = 0.9,
+                 eos_token_id: Optional[int] = None) -> Tensor:
+        """基于 KV cache 的自回归生成（贪心/采样）。
+
+        首个 forward 处理完整 prompt 并建立缓存，之后每步只前向 1 个新 token。
+        """
+        self.eval()
+        eos = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        out = self(input_ids, use_cache=True, return_dict=True)
+        past = out.past_key_values
+        next_logits = out.logits[:, -1, :]
+        generated = [input_ids]
+        for _ in range(max_new_tokens):
+            if temperature <= 0:
+                next_id = next_logits.argmax(dim=-1, keepdim=True)
+            else:
+                probs = F.softmax(next_logits / temperature, dim=-1)
+                if top_p < 1.0:
+                    sorted_p, sorted_i = torch.sort(probs, descending=True)
+                    cum_p = torch.cumsum(sorted_p, dim=-1)
+                    mask = cum_p - sorted_p > top_p
+                    sorted_p[mask] = 0.0
+                    sorted_p /= sorted_p.sum(dim=-1, keepdim=True)
+                    next_id = sorted_i.gather(-1, torch.multinomial(sorted_p, 1))
+                else:
+                    next_id = torch.multinomial(probs, 1)
+            generated.append(next_id)
+            if eos is not None and (next_id == eos).all():
+                break
+            out = self(next_id, past_key_values=past, use_cache=True, return_dict=True)
+            past = out.past_key_values
+            next_logits = out.logits[:, -1, :]
+        return torch.cat(generated, dim=1)
 
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
@@ -524,6 +594,32 @@ def test_basic():
     # --- 6) 权重共享：embedding 与 lm_head 是同一块存储 ---
     assert model.lm_head.weight.data_ptr() == model.embed_tokens.weight.data_ptr()
     print("Tied embeddings OK ✓")
+
+    # --- 7) KV cache 与无缓存推理结果一致 ---
+    model.eval()
+    with torch.no_grad():
+        # 无缓存：完整序列前向
+        ref_logits = model(x)  # [2, 16, 100]
+        # 有缓存：prompt 前 10 个 + 逐 token 增量
+        out = model(x[:, :10], use_cache=True, return_dict=True)
+        past = out.past_key_values
+        cached_logits = [out.logits]
+        for t in range(10, 16):
+            out = model(x[:, t:t+1], past_key_values=past,
+                        use_cache=True, return_dict=True)
+            past = out.past_key_values
+            cached_logits.append(out.logits)
+        cached_logits = torch.cat(cached_logits, dim=1)
+    diff = (ref_logits - cached_logits).abs().max().item()
+    assert diff < 1e-4, f"KV cache 不一致，max diff={diff}"
+    print(f"KV cache consistency OK — max diff={diff:.2e} ✓")
+
+    # --- 8) generate() 产出形状与 EOS 截断 ---
+    with torch.no_grad():
+        gen = model.generate(x[:, :4], max_new_tokens=8, temperature=0.0)
+    assert gen.shape[1] >= 4 and gen.shape[1] <= 12
+    assert (gen[:, :4] == x[:, :4]).all(), "prompt 部分必须原样保留"
+    print(f"generate OK — output shape {tuple(gen.shape)} ✓")
 
     print("\nAll tests passed ✓")
 
